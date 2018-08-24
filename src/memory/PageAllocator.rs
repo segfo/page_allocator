@@ -46,6 +46,7 @@ impl PageMemory{
 pub struct PageMemoryManager{
     freelist:MemoryAreaPtr,
     uselist:MemoryAreaPtr,
+    total_size:usize,
     lost_total:usize,
 }
 
@@ -59,6 +60,7 @@ impl PageMemoryManager{
         let mut manager=PageMemoryManager{
             freelist:MemoryAreaPtr(std::ptr::null_mut()),
             uselist:MemoryAreaPtr(std::ptr::null_mut()),
+            total_size:0,
             lost_total:0
         };
         manager.list_init();
@@ -66,6 +68,11 @@ impl PageMemoryManager{
         manager.uselist=entity;
         manager
     }
+
+    pub fn get_freearea_bytes(&self)->usize{
+        self.total_size
+    }
+
     fn list_init(&mut self){
         let max=unsafe{MEMORY_AREAS.len()-1};
         for i in 1..max{
@@ -116,7 +123,7 @@ impl PageMemoryManager{
         self.freelist.0=entity.0;
     }
     // 
-    pub unsafe fn free_page_frames(&mut self,page:PageMemory){
+    pub unsafe fn free_frames(&mut self,page:PageMemory){
         let mut list = self.uselist;
         let free_start = page.mem as usize;
         let size = page.pages*PAGE_SIZE;
@@ -137,6 +144,9 @@ impl PageMemoryManager{
             self.lost_total+=size;
             return;
         }
+        // メモリの空き合計サイズを増やす
+        self.total_size+=page.pages()*PAGE_SIZE;
+        // 空きエリア情報を初期化する
         (*free_area.0).start = free_start;
         (*free_area.0).size = size;
         (*current.0).next=free_area;
@@ -165,7 +175,7 @@ impl PageMemoryManager{
         }
     }
 
-    pub unsafe fn get_page_frames(&mut self,require_size:usize)->Option<PageMemory>{
+    pub unsafe fn allocate_frames(&mut self,require_size:usize)->Option<PageMemory>{
         let mut list = self.uselist;
         let size = (require_size + 0xfff) & !0xfff;
         loop{
@@ -177,14 +187,15 @@ impl PageMemoryManager{
         if list.0==std::ptr::null_mut(){
             return None;
         }
-
+        // メモリの空き合計サイズを増やす
+        self.total_size -= size;
         let page = PageMemory{
                         mem:std::mem::transmute::<usize,*mut u8>((*list.0).start),
                         pages:size/PAGE_SIZE
                     };
-        if (*list.0).size-require_size > 0{
-            (*list.0).size-=require_size;
-            (*list.0).start+=require_size;
+        if (*list.0).size-size > 0{
+            (*list.0).size-=size;
+            (*list.0).start+=size;
         }else{
             // 管理している領域のサイズがゼロになったら管理情報は不要なので破棄
             self.free_entity(list);
