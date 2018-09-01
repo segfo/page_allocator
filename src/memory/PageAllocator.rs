@@ -1,7 +1,7 @@
 // ベアメタルで使うなら
-// std::mem や std::ptr　を
+// mem や ptr　を
 // core::mem や core::ptr に書き換える
-use std;
+use std::{mem,ptr};
 
 // 管理構造体の個数。実際に使うときは4000個くらい持っておけばよさそう。
 const ARRAY_CNT:usize=0x10;
@@ -17,13 +17,22 @@ struct MemoryArea{
 }
 
 // 管理構造体の静的な初期化
-static mut MEMORY_AREAS:[MemoryArea;ARRAY_CNT]=[
+// ここから管理構造体やオブジェクトの静的な初期化（シングルトン）
+static mut INITIALIZED:bool = false;
+static mut MEM_MANAGER:PageMemoryManager = PageMemoryManager{
+            freelist:MemoryAreaPtr(ptr::null_mut()),
+            uselist:MemoryAreaPtr(ptr::null_mut()),
+            free_total_size:0,
+            lost_total:0,
+            mem_total:0,
+        };
+static mut MEMORY_AREAS:[MemoryArea;ARRAY_CNT] = [
         MemoryArea{
             start:0,size:0,
-            prev:MemoryAreaPtr(std::ptr::null_mut()),
-            next:MemoryAreaPtr(std::ptr::null_mut())
+            prev:MemoryAreaPtr(ptr::null_mut()),
+            next:MemoryAreaPtr(ptr::null_mut())
         };ARRAY_CNT];
-
+// ここまで管理構造体やオブジェクトの静的な初期化（シングルトン）
 #[derive(Clone,Copy,Debug,PartialEq)]
 struct MemoryAreaPtr(*mut MemoryArea);
 
@@ -46,31 +55,30 @@ impl PageMemory{
 pub struct PageMemoryManager{
     freelist:MemoryAreaPtr,
     uselist:MemoryAreaPtr,
-    total_size:usize,
+    free_total_size:usize,
     lost_total:usize,
+    mem_total:usize,
 }
 
 impl PageMemoryManager{
     unsafe fn trans_ptr(area:&mut MemoryArea)->MemoryAreaPtr{
-        let ptr=std::mem::transmute::<&mut MemoryArea,*mut MemoryArea>(area);
+        let ptr=mem::transmute::<&mut MemoryArea,*mut MemoryArea>(area);
         MemoryAreaPtr(ptr)
     }
 
-    pub fn new()->Self{
-        let mut manager=PageMemoryManager{
-            freelist:MemoryAreaPtr(std::ptr::null_mut()),
-            uselist:MemoryAreaPtr(std::ptr::null_mut()),
-            total_size:0,
-            lost_total:0
-        };
-        manager.list_init();
-        let entity = unsafe{manager.get_entity()};
-        manager.uselist=entity;
-        manager
+    pub unsafe fn get_instance()->&'static mut Self{
+        if INITIALIZED{
+            return &mut MEM_MANAGER
+        }
+        MEM_MANAGER.list_init();
+        let entity = unsafe{MEM_MANAGER.get_entity()};
+        MEM_MANAGER.uselist=entity;
+        INITIALIZED = true;
+        &mut MEM_MANAGER
     }
 
     pub fn get_freearea_bytes(&self)->usize{
-        self.total_size
+        self.free_total_size
     }
 
     fn list_init(&mut self){
@@ -90,14 +98,14 @@ impl PageMemoryManager{
     }
 
     unsafe fn get_entity(&mut self)->MemoryAreaPtr{
-        let null=MemoryAreaPtr(std::ptr::null_mut());
+        let null=MemoryAreaPtr(ptr::null_mut());
         let entity=self.freelist;
         if (*entity.0).next!=null{
             let entity=self.freelist;
             self.freelist=(*entity.0).next;
-            (*entity.0).prev=MemoryAreaPtr(std::ptr::null_mut());
-            (*(*entity.0).next.0).prev=MemoryAreaPtr(std::ptr::null_mut());
-            (*entity.0).next=MemoryAreaPtr(std::ptr::null_mut());
+            (*entity.0).prev=MemoryAreaPtr(ptr::null_mut());
+            (*(*entity.0).next.0).prev=MemoryAreaPtr(ptr::null_mut());
+            (*entity.0).next=MemoryAreaPtr(ptr::null_mut());
             entity
         }else{
             null
@@ -106,7 +114,7 @@ impl PageMemoryManager{
     // エンティティの開放（使い終わったものを管理テーブルに戻す）
     unsafe fn free_entity(&mut self,entity:MemoryAreaPtr){
         (*(*entity.0).prev.0).next = (*entity.0).next;
-        if (*entity.0).next.0!=std::ptr::null_mut(){
+        if (*entity.0).next.0!=ptr::null_mut(){
             (*(*entity.0).next.0).prev = (*entity.0).prev;
         }
 
@@ -118,7 +126,7 @@ impl PageMemoryManager{
         // 2.|    {entity}<-prev/next->{freelist.0}-next->{next}                |
         (*entity.0).next=self.freelist;
         // 3.|    (null)<-prev-{entity}<-prev/next->{freelist.0}-next->{next}   |
-        (*entity.0).prev=MemoryAreaPtr(std::ptr::null_mut());
+        (*entity.0).prev=MemoryAreaPtr(ptr::null_mut());
         // 3.|    (null)<-prev-{freelist.0}<-prev/next->{next}-next->{next}     |
         self.freelist.0=entity.0;
     }
@@ -134,25 +142,25 @@ impl PageMemoryManager{
             }
             current = list;
             list = (*list.0).next;
-            if list.0 == std::ptr::null_mut(){break;}
+            if list.0 == ptr::null_mut(){break;}
         }
         let next=(*current.0).next;
         // とりあえず挿入
         let free_area = self.get_entity();
         // 管理構造体の空きがなくなってしまった。
-        if free_area.0==std::ptr::null_mut(){
+        if free_area.0==ptr::null_mut(){
             self.lost_total+=size;
             return;
         }
         // メモリの空き合計サイズを増やす
-        self.total_size+=page.pages()*PAGE_SIZE;
+        self.free_total_size+=page.pages()*PAGE_SIZE;
         // 空きエリア情報を初期化する
         (*free_area.0).start = free_start;
         (*free_area.0).size = size;
         (*current.0).next=free_area;
         (*free_area.0).prev=current;
         (*free_area.0).next=next;
-        if next.0!=std::ptr::null_mut(){
+        if next.0!=ptr::null_mut(){
             (*next.0).prev=free_area;
         }
 
@@ -166,7 +174,7 @@ impl PageMemoryManager{
         }
         // 結合できる場合(後)
         let current=*free_area.0;
-        let not_null = (*free_area.0).next.0!=std::ptr::null_mut();
+        let not_null = (*free_area.0).next.0!=ptr::null_mut();
         
         if  not_null && current.start+current.size==(*next.0).start{
             (*free_area.0).size += (*next.0).size;
@@ -179,18 +187,18 @@ impl PageMemoryManager{
         let mut list = self.uselist;
         let size = (require_size + 0xfff) & !0xfff;
         loop{
-            if list.0==std::ptr::null_mut()||(*list.0).size >= size{
+            if list.0==ptr::null_mut()||(*list.0).size >= size{
                 break;
             }
             list = (*list.0).next;
         }
-        if list.0==std::ptr::null_mut(){
+        if list.0==ptr::null_mut(){
             return None;
         }
         // メモリの空き合計サイズを増やす
-        self.total_size -= size;
+        self.free_total_size -= size;
         let page = PageMemory{
-                        mem:std::mem::transmute::<usize,*mut u8>((*list.0).start),
+                        mem:mem::transmute::<usize,*mut u8>((*list.0).start),
                         pages:size/PAGE_SIZE
                     };
         if (*list.0).size-size > 0{
@@ -207,7 +215,7 @@ impl PageMemoryManager{
 // メモリアドレスとサイズからページメモリを生成するユーティリティ関数
 pub fn memtranse(mem:usize,size:usize)->PageMemory{
     PageMemory{
-        mem:unsafe{std::mem::transmute::<usize,*mut u8>(mem)},
+        mem:unsafe{mem::transmute::<usize,*mut u8>(mem)},
         pages:((size + 0xfff) & !0xfff) / PAGE_SIZE
     }
 }
@@ -223,7 +231,7 @@ fn show_list(mlist:MemoryAreaPtr){
     let mut list = mlist;
     loop{
         unsafe{
-            if list.0==std::ptr::null_mut(){
+            if list.0==ptr::null_mut(){
                 break;
             }
             println!("{:?} : {}",list,show_area(*list.0));
